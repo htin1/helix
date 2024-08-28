@@ -41,9 +41,10 @@ import org.apache.helix.constants.InstanceConstants;
 import org.apache.helix.controller.LogUtil;
 import org.apache.helix.controller.common.CapacityNode;
 import org.apache.helix.controller.pipeline.Pipeline;
-import org.apache.helix.controller.rebalancer.strategy.GreedyRebalanceStrategy;
+import org.apache.helix.controller.rebalancer.strategy.StickyRebalanceStrategy;
 import org.apache.helix.controller.rebalancer.waged.WagedInstanceCapacity;
 import org.apache.helix.controller.rebalancer.waged.WagedResourceWeightsProvider;
+import org.apache.helix.controller.stages.CurrentStateOutput;
 import org.apache.helix.controller.stages.MissingTopStateRecord;
 import org.apache.helix.model.CustomizedState;
 import org.apache.helix.model.CustomizedStateConfig;
@@ -51,6 +52,9 @@ import org.apache.helix.model.CustomizedView;
 import org.apache.helix.model.ExternalView;
 import org.apache.helix.model.IdealState;
 import org.apache.helix.model.InstanceConfig;
+import org.apache.helix.model.LiveInstance;
+import org.apache.helix.model.Message;
+import org.apache.helix.model.Partition;
 import org.apache.helix.model.ResourceAssignment;
 import org.apache.helix.zookeeper.datamodel.ZNRecord;
 import org.slf4j.Logger;
@@ -72,6 +76,9 @@ public class ResourceControllerDataProvider extends BaseControllerDataProvider {
   private final CustomizedStateCache _customizedStateCache;
   // a map from customized state type to customized view cache
   private final Map<String, CustomizedViewCache> _customizedViewCacheMap;
+
+  // maintain a cache of ideal state (preference list + best possible assignment) which will be managed ondemand in rebalancer
+  private final Map<String, ZNRecord> _ondemandIdealStateCache;
 
   // maintain a cache of bestPossible assignment across pipeline runs
   // TODO: this is only for customRebalancer, remove it and merge it with _idealMappingCache.
@@ -149,6 +156,7 @@ public class ResourceControllerDataProvider extends BaseControllerDataProvider {
     _refreshedChangeTypes = ConcurrentHashMap.newKeySet();
     _customizedStateCache = new CustomizedStateCache(this, _aggregationEnabledTypes);
     _customizedViewCacheMap = new HashMap<>();
+    _ondemandIdealStateCache = new HashMap<>();
   }
 
   public synchronized void refresh(HelixDataAccessor accessor) {
@@ -187,11 +195,11 @@ public class ResourceControllerDataProvider extends BaseControllerDataProvider {
       // Remove all cached IdealState because it is a global computation cannot partially be
       // performed for some resources. The computation is simple as well not taking too much resource
       // to recompute the assignments.
-      Set<String> cachedGreedyIdealStates = _idealMappingCache.values().stream().filter(
+      Set<String> cachedStickyIdealStates = _idealMappingCache.values().stream().filter(
               record -> record.getSimpleField(IdealState.IdealStateProperty.REBALANCE_STRATEGY.name())
-                  .equals(GreedyRebalanceStrategy.class.getName())).map(ZNRecord::getId)
+                  .equals(StickyRebalanceStrategy.class.getName())).map(ZNRecord::getId)
           .collect(Collectors.toSet());
-      _idealMappingCache.keySet().removeAll(cachedGreedyIdealStates);
+      _idealMappingCache.keySet().removeAll(cachedStickyIdealStates);
     }
 
     LogUtil.logInfo(logger, getClusterEventId(), String.format(
@@ -389,6 +397,28 @@ public class ResourceControllerDataProvider extends BaseControllerDataProvider {
   }
 
   /**
+   * Get cached ideal state (preference list + best possible assignment) for a resource
+   * @param resource
+   * @return
+   */
+  public ZNRecord getCachedOndemandIdealState(String resource) {
+    return _ondemandIdealStateCache.get(resource);
+  }
+
+  /**
+   * Cache ideal state (preference list + best possible assignment) for a resource
+   * @param resource
+   * @return
+   */
+  public void setCachedOndemandIdealState(String resource, ZNRecord idealState) {
+    _ondemandIdealStateCache.put(resource, idealState);
+  }
+
+  public void clearCachedOndemandIdealStates() {
+    _ondemandIdealStateCache.clear();
+  }
+
+  /**
    * Get cached resourceAssignment (bestPossible mapping) for a resource
    * @param resource
    * @return
@@ -555,6 +585,38 @@ public class ResourceControllerDataProvider extends BaseControllerDataProvider {
 
   public Set<CapacityNode> getSimpleCapacitySet() {
     return _simpleCapacitySet;
+  }
+
+  public void populateSimpleCapacitySetUsage(final Set<String> resourceNameSet,
+      final CurrentStateOutput currentStateOutput) {
+    Map<String, LiveInstance> instanceMap = getLiveInstances();
+    // Convert the assignableNodes to map for quick lookup
+    Map<String, CapacityNode> simpleCapacityMap =
+        _simpleCapacitySet.stream().collect(Collectors.toMap(CapacityNode::getId, node -> node));
+    for (String resourceName : resourceNameSet) {
+      // Process current state mapping
+      for (Map.Entry<Partition, Map<String, String>> entry : currentStateOutput.getCurrentStateMap(
+          resourceName).entrySet()) {
+        String partition = entry.getKey().getPartitionName();
+        for (Map.Entry<String, String> instanceState : entry.getValue().entrySet()) {
+          CapacityNode node = simpleCapacityMap.get(instanceState.getKey());
+          if (node != null) {
+            node.canAdd(resourceName, partition);
+          }
+        }
+      }
+      // Process pending state mapping
+      for (Map.Entry<Partition, Map<String, Message>> entry : currentStateOutput.getPendingMessageMap(
+          resourceName).entrySet()) {
+        String partition = entry.getKey().getPartitionName();
+        for (Map.Entry<String, Message> instanceState : entry.getValue().entrySet()) {
+          CapacityNode node = simpleCapacityMap.get(instanceState.getKey());
+          if (node != null) {
+            node.canAdd(resourceName, partition);
+          }
+        }
+      }
+    }
   }
 
   private void refreshDisabledInstancesForAllPartitionsSet() {
